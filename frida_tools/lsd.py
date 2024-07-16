@@ -1,11 +1,24 @@
 def main() -> None:
     import functools
+    import threading
 
     import frida
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.eventloop import call_soon_threadsafe
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout.containers import HSplit, VSplit
+    from prompt_toolkit.layout.layout import Layout
+    from prompt_toolkit.widgets import Label
 
     from frida_tools.application import ConsoleApplication
+    from frida_tools.reactor import Reactor
+
 
     class LSDApplication(ConsoleApplication):
+        def __init__(self) -> None:
+            super().__init__(self._process_input, self._on_stop)
+            self._ui_app = None
+
         def _usage(self) -> str:
             return "%(prog)s [options]"
 
@@ -13,68 +26,64 @@ def main() -> None:
             return False
 
         def _start(self) -> None:
+            pass
+
+        def _process_input(self, reactor: Reactor) -> None:
             try:
                 devices = frida.enumerate_devices()
             except Exception as e:
                 self._update_status(f"Failed to enumerate devices: {e}")
                 self._exit(1)
                 return
-            device_name = {}
-            device_os = {}
-            for device in devices:
-                device_name[device.id] = device.name
-                try:
-                    params = device.query_system_parameters()
-                except:
-                    continue
-                device_name[device.id] = params.get("name", device.name)
+
+            self._ui_app = Application(full_screen=False)
+            self._ui_app.output.show_cursor = lambda: None
+
+            id_rows = []
+            type_rows = []
+            name_rows = []
+            os_rows = []
+            for device in sorted(devices, key=functools.cmp_to_key(compare_devices)):
+                id_rows.append(Label(device.id, dont_extend_width=True))
+                type_rows.append(Label(device.type, dont_extend_width=True))
+                name_rows.append(Label(device.name, dont_extend_width=True))
+                os_label = Label("(loading)", dont_extend_width=True)
+                os_rows.append(os_label)
+                worker = threading.Thread(target=self._fetch_parameters, args=(device, os_label))
+                worker.start()
+
+            def simulate_work():
+                time.sleep(1)
+                os_rows[0].text = "BADGER"
+
+            body = VSplit(
+                [
+                    HSplit([Label("Id", dont_extend_width=True), HSplit(id_rows)], padding_char="-", padding=1),
+                    HSplit([Label("Type", dont_extend_width=True), HSplit(type_rows)], padding_char="-", padding=1),
+                    HSplit([Label("Name", dont_extend_width=True), HSplit(name_rows)], padding_char="-", padding=1),
+                    HSplit([Label("OS", dont_extend_width=True), HSplit(os_rows)], padding_char="-", padding=1),
+                ],
+                padding=2,
+            )
+
+            self._ui_app.layout = Layout(body)
+            self._ui_app.run()
+
+        def _fetch_parameters(self, device, os_label):
+            try:
+                params = device.query_system_parameters()
                 os = params["os"]
                 version = os.get("version")
                 if version is not None:
-                    device_os[device.id] = os["name"] + " " + version
+                    os_label.text = os["name"] + " " + version
                 else:
-                    device_os[device.id] = os["name"]
-            id_column_width = max(map(lambda device: len(device.id) if device.id is not None else 0, devices))
-            type_column_width = max(map(lambda device: len(device.type) if device.type is not None else 0, devices))
-            name_column_width = max(map(lambda name: len(name) if name is not None else 0, device_name.values()))
-            os_column_width = max(map(lambda os: len(os) if os is not None else 0, device_os.values()))
-            header_format = (
-                "%-"
-                + str(id_column_width)
-                + "s  "
-                + "%-"
-                + str(type_column_width)
-                + "s  "
-                + "%-"
-                + str(name_column_width)
-                + "s  "
-                + "%-"
-                + str(os_column_width)
-                + "s"
-            )
-            self._print(header_format % ("Id", "Type", "Name", "OS"))
-            self._print(
-                f"{id_column_width * '-'}  {type_column_width * '-'}  {name_column_width * '-'}  {os_column_width * '-'}"
-            )
-            line_format = (
-                "%-"
-                + str(id_column_width)
-                + "s  "
-                + "%-"
-                + str(type_column_width)
-                + "s  "
-                + "%-"
-                + str(name_column_width)
-                + "s  "
-                + "%-"
-                + str(os_column_width)
-                + "s"
-            )
-            for device in sorted(devices, key=functools.cmp_to_key(compare_devices)):
-                self._print(
-                    line_format % (device.id, device.type, device_name.get(device.id), device_os.get(device.id, ""))
-                )
-            self._exit(0)
+                    os_label.text = os["name"]
+            except:
+                os_label.text = ""
+            self._ui_app.invalidate()
+
+        def _on_stop(self) -> None:
+            pass # TODO
 
     def compare_devices(a: frida.core.Device, b: frida.core.Device) -> int:
         a_score = score(a)
