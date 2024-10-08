@@ -91,6 +91,9 @@ def main() -> None:
                 "-q", "--quiet", help="do not format output messages", action="store_true", default=False
             )
             parser.add_argument(
+                "-c", "--objc", help="generated log infomation with objc format", action="store_true", default=False
+            )
+            parser.add_argument(
                 "-d",
                 "--decorate",
                 help="add module name to generated onEnter log statement",
@@ -122,6 +125,7 @@ def main() -> None:
             self._profile = self._profile_builder.build()
             self._quiet: bool = options.quiet
             self._decorate: bool = options.decorate
+            self._objc: bool = options.objc
             self._output: Optional[OutputFile] = None
             self._output_path: str = options.output
 
@@ -153,7 +157,7 @@ def main() -> None:
 
             self._tracer = Tracer(
                 self._reactor,
-                FileRepository(self._reactor, self._decorate),
+                FileRepository(self._reactor, self._decorate,self._objc),
                 self._profile,
                 self._init_scripts,
                 log_handler=self._log,
@@ -366,7 +370,6 @@ class Tracer:
 
     def _on_message(self, message, data, ui) -> None:
         handled = False
-
         if message["type"] == "send":
             try:
                 payload = message["payload"]
@@ -453,6 +456,7 @@ class Repository:
         self._on_load_callback: Optional[Callable[[TraceTarget, str, str], None]] = None
         self._on_update_callback: Optional[Callable[[TraceTarget, str, str], None]] = None
         self._decorate = False
+        self._objc = False
 
     def ensure_handler(self, target: TraceTarget):
         raise NotImplementedError("not implemented")
@@ -490,16 +494,50 @@ class Repository:
     def _create_stub_native_handler(self, target: TraceTarget, decorate: bool) -> str:
         if target.flavor == "objc":
             state = {"index": 2}
-
+            is_objc = 0
+            if self._objc:
+                is_objc = 1
             def objc_arg(m):
                 index = state["index"]
                 r = ":${args[%d]} " % index
                 state["index"] = index + 1
                 return r
-
-            log_str = "`" + re.sub(r":", objc_arg, target.display_name) + "`"
+            first_arg = "${new ObjC.Object(args[0])}"
+            if is_objc == 0:
+                first_arg = ""
+            log_str = "`${date}--" + re.sub(r":", objc_arg, target.display_name) + " start " + first_arg + "`"
             if log_str.endswith("} ]`"):
-                log_str = log_str[:-3] + "]`"
+                log_str = log_str[:-3] + "] start  " +  first_arg + "`"
+            
+            max_index = state["index"]
+            args_str = ""
+            if max_index > 2:
+                for i in range(2, max_index):
+                    cur_str = """\
+if (args[%d] !== null) {
+    \tvar b1 = args[%d].toString()
+    \tvar b2 = %d == 1
+    \tvar invalidaAddr = b1.charAt(2) === "1"
+    \tif(b1.length >= 11 && b1.length <= 13 && b2 && invalidaAddr == false) {
+    \t  var args%d = new ObjC.Object(args[%d]);
+    \t  log(`${date}--arg%d is ${args%d}`)
+    \t}
+    
+\t  }
+""" % (i,i,is_objc,i,i,i,i) 
+                    args_str = args_str + cur_str + "\n\t  "
+
+            # 判断hook函数是set方法，就不去打印返回值
+            string = target.display_name
+            # 使用空格分割字符串
+            parts = string.split(' ')
+            # 取第二部分字符串
+            second_part = parts[1]
+            # 判断第二部分字符串是否以 : 结尾
+            if second_part.endswith(':]') and second_part.startswith('set'):
+                is_objc = 0
+
+
         else:
             for man_section in (2, 3):
                 args = []
@@ -570,6 +608,8 @@ class Repository:
                     "args": ", ".join(args),
                     "module_string": module_string,
                 }
+            args_str = ""
+            is_objc = 0
 
         return """\
 /*
@@ -583,6 +623,24 @@ class Repository:
   /**
    * Called synchronously when about to call %(display_name)s.
    *
+    var backtrace = Thread.backtrace(this.context, Backtracer.ACCURATE)
+    var isTarget = false
+    for (var i = 0; i <= backtrace.length - 1; i++) {
+        var addr = backtrace[i];
+        try {
+            // 可能会抛出异常的代码块
+            var firstFuncName = DebugSymbol.fromAddress(addr);
+            log(firstFuncName)
+            var firstFuncNameStr = firstFuncName + ' str'
+            if (firstFuncNameStr.indexOf("_dispatch_root_queue_drain") >= 0) {
+            isTarget = true
+            break
+            }
+        } catch (error) {
+
+        }
+    }
+   
    * @this {object} - Object allowing you to store state for use in onLeave.
    * @param {function} log - Call this function with a string to be presented to the user.
    * @param {array} args - Function arguments represented as an array of NativePointer objects.
@@ -594,7 +652,18 @@ class Repository:
    * use "this" which is an object for keeping state local to an invocation.
    */
   onEnter(log, args, state) {
+    // 格式化时间为年月日时分秒毫秒
+    // 获取当前时间
+    var now = new Date();
+    var date = now.getFullYear() + '-' +
+    String(now.getMonth() + 1).padStart(2, '0') + '-' +
+    String(now.getDate()).padStart(2, '0') + ' ' +
+    String(now.getHours()).padStart(2, '0') + ':' +
+    String(now.getMinutes()).padStart(2, '0') + ':' +
+    String(now.getSeconds()).padStart(2, '0') + '.' +
+    String(now.getMilliseconds()).padStart(3, '0');
     log(%(log_str)s);
+    %(args_str)s
   },
 
   /**
@@ -607,12 +676,37 @@ class Repository:
    * @param {NativePointer} retval - Return value represented as a NativePointer object.
    * @param {object} state - Object allowing you to keep state across function calls.
    */
+
   onLeave(log, retval, state) {
+    // 格式化时间为年月日时分秒毫秒
+    // 获取当前时间
+    var now = new Date();
+    var date = now.getFullYear() + '-' +
+    String(now.getMonth() + 1).padStart(2, '0') + '-' +
+    String(now.getDate()).padStart(2, '0') + ' ' +
+    String(now.getHours()).padStart(2, '0') + ':' +
+    String(now.getMinutes()).padStart(2, '0') + ':' +
+    String(now.getSeconds()).padStart(2, '0') + '.' +
+    String(now.getMilliseconds()).padStart(3, '0');
+    if (retval !== undefined) {
+        log(`${date}--%(display_name)s res is ${retval}`);
+        
+        var b1 = retval.toString()
+        var b2 = %(is_objc)s == 1
+        var invalidaAddr = b1.charAt(2) === "1"
+        if (b1.length >= 11 && b1.length <= 13 && b2 && invalidaAddr == false) {
+          var res = new ObjC.Object(retval);
+          log(`${date}--%(display_name)s res is ${res}`);
+        }
+    }
+    log(`${date}--%(display_name)s end`)
   }
 }
 """ % {
             "display_name": target.display_name,
             "log_str": log_str,
+            "args_str": args_str,
+            "is_objc": is_objc,
         }
 
     def _create_stub_java_handler(self, target: TraceTarget, decorate) -> str:
@@ -674,7 +768,7 @@ class MemoryRepository(Repository):
 
 
 class FileRepository(Repository):
-    def __init__(self, reactor: Reactor, decorate: bool) -> None:
+    def __init__(self, reactor: Reactor, decorate: bool, objc: bool) -> None:
         super().__init__()
         self._reactor = reactor
         self._handler_by_id = {}
@@ -684,6 +778,7 @@ class FileRepository(Repository):
         self._repo_dir = os.path.join(os.getcwd(), "__handlers__")
         self._repo_monitors = {}
         self._decorate = decorate
+        self._objc = objc
 
     def ensure_handler(self, target: TraceTarget) -> str:
         entry = self._handler_by_id.get(target.identifier)
